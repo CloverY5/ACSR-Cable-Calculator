@@ -1,20 +1,13 @@
 """
 AppController – mediates between ConductorDatabase (Model) and MainView (View).
-
-Supports:
-  • Transposed symmetric/asymmetric line  (D12=D23=D31 or different)
-  • Untransposed asymmetric line          (per-phase L and C)
-  • Double-circuit line                   (equivalent GMR/GMD)
-  • Bundle of 1–4 sub-conductors per phase
-  • Inductance, capacitance and all derived reactances
 """
 
 from model.conductor_db import (
     ConductorDatabase,
-    COL_CODE, COL_RMG, COL_R_DC20, COL_D_TOTAL,
+    COL_CODE, COL_RMG, COL_R_DC20, COL_D_TOTAL, COL_RATIO,
 )
 from model.calculations import (
-    correct_resistance,
+    acsr_resistance,
     bundle_gmr,
     bundle_radius,
     geometric_mean_distance,
@@ -27,14 +20,18 @@ from model.calculations import (
     capacitive_reactance_per_km,
     total_reactance,
     total_capacitive_reactance,
+    total_resistance,
     to_mH_per_km,
     to_nF_per_km,
 )
 
-# Line configuration identifiers (must match values used in MainView)
-CFG_TRANSPOSED    = "transposed"
-CFG_UNTRANSPOSED  = "untransposed"
-CFG_DOUBLE        = "double"
+# Diameters of individual strands (mm)
+COL_D_AL = "D. Alambre Al (mm)"
+COL_D_AC = "D. Alambre Acero (mm)"
+
+CFG_TRANSPOSED   = "transposed"
+CFG_UNTRANSPOSED = "untransposed"
+CFG_DOUBLE       = "double"
 
 
 class AppController:
@@ -52,7 +49,7 @@ class AppController:
         self._view.populate_calibre_list(calibres)
 
     # ------------------------------------------------------------------
-    # Method 1 – direct search by code name
+    # Method 1 – direct search
     # ------------------------------------------------------------------
 
     def handle_search_by_code(self, code: str):
@@ -100,7 +97,7 @@ class AppController:
         self._push_conductor_info(conductor)
 
     # ------------------------------------------------------------------
-    # Conductor confirmation
+    # Confirmation
     # ------------------------------------------------------------------
 
     def handle_confirm_conductor(self):
@@ -139,12 +136,14 @@ class AppController:
             D23    = _parse_pos("D₂₃", params["D23"])
             D31    = _parse_pos("D₃₁", params["D31"])
 
-            rmg_mm    = float(self._confirmed_conductor[COL_RMG])
-            r_base    = float(self._confirmed_conductor[COL_R_DC20])
+            rmg_mm     = float(self._confirmed_conductor[COL_RMG])
             d_total_mm = float(self._confirmed_conductor[COL_D_TOTAL])
+            r_cond_m   = (d_total_mm / 2.0) / 1000.0
 
-            # Physical radius from total diameter [m]
-            r_cond_m = (d_total_mm / 2.0) / 1000.0
+            # ── Extract strand info for ACSR resistance correction ──
+            n_al, n_ac = _parse_stranding(self._confirmed_conductor[COL_RATIO])
+            d_al_mm = float(self._confirmed_conductor[COL_D_AL])
+            d_ac_mm = float(self._confirmed_conductor[COL_D_AC])
 
             if n_cond > 1:
                 spacing = _parse_pos("Separación del haz", params["spacing"])
@@ -159,36 +158,42 @@ class AppController:
             return
 
         try:
-            R_corr = correct_resistance(r_base, T2=temp)
+            # ── ACSR resistance correction (always computed) ───────────
+            res_dict = acsr_resistance(n_al, d_al_mm, n_ac, d_ac_mm, temp)
+            R_TOT = res_dict["R_TOT"]
+            R_total_line = total_resistance(R_TOT, length)
 
-            # ── Bundle GMR (inductance) and bundle radius (capacitance) ──
+            # ── Bundle geometry ────────────────────────────────────────
             rmg_haz_m  = bundle_gmr(rmg_mm, spacing, n_cond)
             r_bundle_m = bundle_radius(r_cond_m, spacing, n_cond)
-
             rmg_haz_mm  = rmg_haz_m  * 1000.0
             r_bundle_mm = r_bundle_m * 1000.0
 
-            # ── Dispatch by configuration ─────────────────────────────────
+            # ── Dispatch by line configuration ─────────────────────────
             if config == CFG_TRANSPOSED:
                 results = self._calc_transposed(
                     freq, length, D12, D23, D31,
-                    rmg_haz_m, r_bundle_m, rmg_haz_mm, r_bundle_mm, R_corr
+                    rmg_haz_m, r_bundle_m, rmg_haz_mm, r_bundle_mm
                 )
-
             elif config == CFG_UNTRANSPOSED:
                 results = self._calc_untransposed(
                     freq, length, D12, D23, D31,
-                    rmg_mm / 1000.0, r_cond_m, rmg_haz_mm, R_corr
+                    rmg_mm / 1000.0, r_cond_m, rmg_haz_mm
                 )
-
             elif config == CFG_DOUBLE:
                 results = self._calc_double_circuit(
                     freq, length, D12, D23, D31, D_between,
-                    rmg_mm / 1000.0, r_cond_m, rmg_haz_mm, r_bundle_mm, R_corr
+                    rmg_mm / 1000.0, r_cond_m, r_bundle_mm
                 )
             else:
-                self._view.show_error("Configuración", f"Configuración desconocida: {config}")
+                self._view.show_error("Configuración",
+                                      f"Configuración desconocida: {config}")
                 return
+
+            # ── Merge resistance results into the final payload ────────
+            results["res_data"]     = res_dict
+            results["R_TOT"]        = f"{R_TOT:.6f}"
+            results["R_total_line"] = f"{R_total_line:.4f}"
 
         except (ValueError, ZeroDivisionError) as exc:
             self._view.show_error("Error de cálculo", str(exc))
@@ -197,50 +202,43 @@ class AppController:
         self._view.display_results(results)
 
     # ------------------------------------------------------------------
-    # Private calculation methods
+    # Per-configuration calculations (return dict without resistance)
     # ------------------------------------------------------------------
 
     def _calc_transposed(self, freq, length, D12, D23, D31,
                          rmg_haz_m, r_bundle_m,
-                         rmg_haz_mm, r_bundle_mm, R_corr):
-        """Transposed symmetric or asymmetric line."""
+                         rmg_haz_mm, r_bundle_mm):
         dmg = geometric_mean_distance(D12, D23, D31)
 
-        # Inductance
         L_H_m   = inductance_per_meter(dmg, rmg_haz_m)
         L_mH_km = to_mH_per_km(L_H_m)
         XL_km   = reactance_per_km(freq, L_H_m)
         XL_tot  = total_reactance(XL_km, length)
 
-        # Capacitance
         C_F_m   = capacitance_per_meter(dmg, r_bundle_m)
         C_nF_km = to_nF_per_km(C_F_m)
         Xc_km   = capacitive_reactance_per_km(freq, C_F_m)
         Xc_tot  = total_capacitive_reactance(Xc_km, length)
 
         return {
-            "config":    "Transpuesta",
-            "dmg":       f"{dmg:.4f}",
-            "rmg_haz":   f"{rmg_haz_mm:.4f}",
-            "r_bundle":  f"{r_bundle_mm:.4f}",
-            "L_mH_km":   f"{L_mH_km:.4f}",
-            "XL_km":     f"{XL_km:.4f}",
-            "R_corr":    f"{R_corr:.4f}",
-            "XL_total":  f"{XL_tot:.4f}",
-            "C_nF_km":   f"{C_nF_km:.4f}",
-            "Xc_km":     f"{Xc_km:.4f}",
-            "Xc_total":  f"{Xc_tot:.4f}",
-            # Per-phase fields (N/A for transposed)
+            "config":   "Transpuesta",
+            "dmg":      f"{dmg:.4f}",
+            "rmg_haz":  f"{rmg_haz_mm:.4f}",
+            "r_bundle": f"{r_bundle_mm:.4f}",
+            "L_mH_km":  f"{L_mH_km:.4f}",
+            "XL_km":    f"{XL_km:.4f}",
+            "XL_total": f"{XL_tot:.4f}",
+            "C_nF_km":  f"{C_nF_km:.4f}",
+            "Xc_km":    f"{Xc_km:.4f}",
+            "Xc_total": f"{Xc_tot:.4f}",
             "La": None, "Lb": None, "Lc": None,
             "Ca": None, "Cb": None, "Cc": None,
         }
 
     def _calc_untransposed(self, freq, length, D12, D23, D31,
-                           rmg_m, r_m, rmg_haz_mm, R_corr):
-        """Untransposed asymmetric line – per-phase L and C."""
+                           rmg_m, r_m, rmg_haz_mm):
         dmg = geometric_mean_distance(D12, D23, D31)
 
-        # Per-phase inductance
         La, Lb, Lc = inductance_untransposed(rmg_m, D12, D23, D31)
         L_avg = (La + Lb + Lc) / 3.0
 
@@ -248,7 +246,6 @@ class AppController:
         XLb = reactance_per_km(freq, Lb)
         XLc = reactance_per_km(freq, Lc)
 
-        # Per-phase capacitance
         Ca, Cb, Cc = capacitance_untransposed(r_m, D12, D23, D31)
         C_avg = (Ca + Cb + Cc) / 3.0
 
@@ -263,38 +260,31 @@ class AppController:
             "r_bundle": f"{r_m*1000:.4f}",
             "L_mH_km":  f"{to_mH_per_km(L_avg):.4f}",
             "XL_km":    f"{reactance_per_km(freq, L_avg):.4f}",
-            "R_corr":   f"{R_corr:.4f}",
             "XL_total": f"{total_reactance(reactance_per_km(freq, L_avg), length):.4f}",
             "C_nF_km":  f"{to_nF_per_km(C_avg):.4f}",
             "Xc_km":    f"{capacitive_reactance_per_km(freq, C_avg):.4f}",
             "Xc_total": f"{total_capacitive_reactance(capacitive_reactance_per_km(freq, C_avg), length):.4f}",
-            # Per-phase
-            "La": f"{to_mH_per_km(La):.4f}",
-            "Lb": f"{to_mH_per_km(Lb):.4f}",
-            "Lc": f"{to_mH_per_km(Lc):.4f}",
+            "La":  f"{to_mH_per_km(La):.4f}",
+            "Lb":  f"{to_mH_per_km(Lb):.4f}",
+            "Lc":  f"{to_mH_per_km(Lc):.4f}",
             "XLa": f"{XLa:.4f}", "XLb": f"{XLb:.4f}", "XLc": f"{XLc:.4f}",
-            "Ca": f"{to_nF_per_km(Ca):.4f}",
-            "Cb": f"{to_nF_per_km(Cb):.4f}",
-            "Cc": f"{to_nF_per_km(Cc):.4f}",
+            "Ca":  f"{to_nF_per_km(Ca):.4f}",
+            "Cb":  f"{to_nF_per_km(Cb):.4f}",
+            "Cc":  f"{to_nF_per_km(Cc):.4f}",
             "Xca": f"{Xca:.4f}", "Xcb": f"{Xcb:.4f}", "Xcc": f"{Xcc:.4f}",
         }
 
     def _calc_double_circuit(self, freq, length, D12, D23, D31, D_between,
-                             rmg_m, r_m, rmg_haz_mm, r_bundle_mm, R_corr):
-        """Double-circuit line – equivalent parallel combination."""
-        dmg_eq, rmg_eq = double_circuit_gmr(rmg_m, D12, D23, D31, D_between)
-
-        # Capacitance equivalent radius (same structure, using physical r)
+                             rmg_m, r_m, r_bundle_mm):
         import math
+        dmg_eq, rmg_eq = double_circuit_gmr(rmg_m, D12, D23, D31, D_between)
         r_eq_cap = math.sqrt(r_m * D_between)
 
-        # Inductance
         L_H_m   = inductance_per_meter(dmg_eq, rmg_eq)
         L_mH_km = to_mH_per_km(L_H_m)
         XL_km   = reactance_per_km(freq, L_H_m)
         XL_tot  = total_reactance(XL_km, length)
 
-        # Capacitance
         C_F_m   = capacitance_per_meter(dmg_eq, r_eq_cap)
         C_nF_km = to_nF_per_km(C_F_m)
         Xc_km   = capacitive_reactance_per_km(freq, C_F_m)
@@ -307,7 +297,6 @@ class AppController:
             "r_bundle": f"{r_bundle_mm:.4f}",
             "L_mH_km":  f"{L_mH_km:.4f}",
             "XL_km":    f"{XL_km:.4f}",
-            "R_corr":   f"{R_corr:.4f}",
             "XL_total": f"{XL_tot:.4f}",
             "C_nF_km":  f"{C_nF_km:.4f}",
             "Xc_km":    f"{Xc_km:.4f}",
@@ -317,7 +306,7 @@ class AppController:
         }
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Helpers
     # ------------------------------------------------------------------
 
     def _push_conductor_info(self, conductor: dict):
@@ -329,7 +318,7 @@ class AppController:
 
 
 # ---------------------------------------------------------------------------
-# Utility
+# Utilities
 # ---------------------------------------------------------------------------
 
 def _parse_pos(label: str, value: str) -> float:
@@ -340,3 +329,20 @@ def _parse_pos(label: str, value: str) -> float:
     if v <= 0:
         raise ValueError(f"'{label}': debe ser un número positivo (ingresado: {v}).")
     return v
+
+
+def _parse_stranding(ratio: str) -> tuple[int, int]:
+    """
+    Parse the 'Al/Ac' stranding string from the catalogue.
+        '26/7'  → (26, 7)
+        '6/1'   → (6, 1)
+    """
+    try:
+        parts = ratio.replace(" ", "").split("/")
+        n_al = int(parts[0])
+        n_ac = int(parts[1])
+        if n_al <= 0 or n_ac <= 0:
+            raise ValueError
+        return n_al, n_ac
+    except (ValueError, IndexError, AttributeError):
+        raise ValueError(f"Formato de cableado no reconocido: '{ratio}' (esperado 'NN/NN').")
