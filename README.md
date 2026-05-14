@@ -242,6 +242,11 @@ Proyecto académico de uso libre con fines educativos.
 
 ---
 
-## Autor
+## Autores
 
-Desarrollado como parte de las prácticas de laboratorio de Análisis de Sistemas Eléctricos de Potencia (ASEP).
+Desarrollado como parte de las prácticas de laboratorio de Análisis de Sistemas Eléctricos de Potencia (ASEP) por:
+
+- **Clover Y5**
+- **H. R. Roger Takeshi**
+- **E. S. Genesis Abril**
+- **R. H. Marco Antonio**
