@@ -1,6 +1,6 @@
 # Calculadora de Líneas de Transmisión ACSR
 
-Aplicación de escritorio (Python + Tkinter) para el cálculo de los parámetros eléctricos de líneas de transmisión aéreas con conductores ACSR (Aluminum Conductor Steel Reinforced). Desarrollada como parte del laboratorio de la asignatura **Análisis de Sistemas Eléctricos de Potencia (ASEP)** — 8° semestre, Ingeniería Eléctrica.
+Aplicación de escritorio (Python + Tkinter) para el cálculo de los parámetros eléctricos de líneas de transmisión aéreas con conductores ACSR (Aluminum Conductor Steel Reinforced) y conductores sólidos. Desarrollada como parte del laboratorio de la asignatura **Análisis de Sistemas Eléctricos de Potencia (ASEP)** — 8° semestre, Ingeniería Eléctrica.
 
 ---
 
@@ -8,10 +8,13 @@ Aplicación de escritorio (Python + Tkinter) para el cálculo de los parámetros
 
 - **Catálogo integrado** de conductores ACSR estándar (Swan, Sparrow, Drake, Hawk, Dove, etc.) basado en la tabla de CENTELSA, con búsqueda directa por código o filtrado en cascada (calibre → cableado → conductor).
 - **Corrección rigurosa de resistencia por temperatura** específica para ACSR, considerando aluminio y acero como conductores en paralelo, cada uno con su propia resistividad, área y coeficiente térmico.
-- **Tres configuraciones de línea** soportadas:
+- **Cuatro configuraciones de línea** soportadas:
   - Línea trifásica transpuesta (simétrica o asimétrica)
-  - Línea trifásica no transpuesta (resultados por fase)
-  - Línea de doble circuito
+  - Línea trifásica no transpuesta (resultados individuales por fase)
+  - Doble circuito / conductores en paralelo con **conductores iguales**
+  - Doble circuito / conductores en paralelo con **conductores distintos** entre circuitos
+- **Geometría flexible para doble circuito**: ingreso por coordenadas (x, y) de cada conductor, permitiendo número arbitrario de conductores por lado (2, 3, 4 o más) y disposiciones irregulares.
+- **Soporte para conductores sólidos** (cobre u otro material) además del catálogo ACSR, mediante ingreso manual del radio.
 - **Haces de 1 a 4 conductores por fase** con cálculo automático del RMG y radio equivalentes.
 - **Cálculo completo de inductancia y capacitancia** con sus respectivas reactancias y totales de línea.
 
@@ -30,7 +33,7 @@ ACSR-Calculator/
 │   └── calculations.py            ← Motor de cálculo (resistencia, L, C)
 ├── view/
 │   ├── __init__.py
-│   └── main_view.py               ← Interfaz gráfica Tkinter
+│   └── main_view.py               ← Interfaz gráfica Tkinter + diálogo doble circuito
 └── controller/
     ├── __init__.py
     └── app_controller.py          ← Orquestación View ↔ Model
@@ -62,13 +65,39 @@ Desde la carpeta raíz del proyecto:
 python main.py
 ```
 
-Aparecerá la ventana principal. El flujo de uso es:
+### Flujo general de uso
 
-1. Seleccionar un conductor del catálogo (Método 1 o Método 2).
+1. Seleccionar un conductor del catálogo (Método 1 directo o Método 2 en cascada).
 2. Confirmar el conductor con el botón **Confirmar Conductor**.
 3. Seleccionar la configuración de la línea: transpuesta, no transpuesta o doble circuito.
-4. Ingresar los parámetros eléctricos y geométricos (frecuencia, longitud, temperatura, distancias entre fases, etc.).
-5. Hacer clic en **CALCULAR PARÁMETROS** para obtener los resultados.
+4. Ingresar los parámetros eléctricos generales (frecuencia, longitud, temperatura).
+5. Según la configuración:
+   - **Transpuesta / No Transpuesta**: ingresar distancias entre fases `D₁₂`, `D₂₃`, `D₃₁` y, si aplica, número de conductores por fase y separación del haz.
+   - **Doble Circuito**: hacer clic en `⚙ Configurar Doble Circuito` para abrir el diálogo de configuración (ver siguiente sección).
+6. Hacer clic en **CALCULAR PARÁMETROS** para obtener los resultados.
+
+### Configuración del Doble Circuito
+
+El botón **⚙ Configurar Doble Circuito** abre un diálogo modal donde se especifica:
+
+**Tipo de conductores**: un checkbox `Mismo conductor en ambos circuitos`:
+- Marcado → ambos lados usan el conductor principal seleccionado en el catálogo.
+- Desmarcado → se habilita el lado B para elegir otro conductor distinto.
+
+**Lado A (Circuito 1)**:
+- *ACSR*: utiliza el conductor principal ya confirmado.
+- *Sólido*: pide el radio en milímetros (para cobre o conductores sin catálogo).
+
+**Lado B (Circuito 2)** — solo si los conductores son distintos:
+- *ACSR*: selector independiente del catálogo (calibre → cableado → conductor → confirmar).
+- *Sólido*: radio en milímetros.
+
+**Coordenadas (x, y)** de cada conductor en metros:
+- Una tabla editable para cada lado.
+- Botones `+ Agregar` y `− Quitar` permiten ajustar el número de conductores por lado (2, 3, 4 o los que se necesiten).
+- El origen es arbitrario; solo importan las distancias relativas.
+
+Al hacer clic en `Aceptar`, la configuración queda guardada. Se puede modificar en cualquier momento abriendo el diálogo nuevamente.
 
 ---
 
@@ -76,15 +105,13 @@ Aparecerá la ventana principal. El flujo de uso es:
 
 ### 1. Corrección de resistencia por temperatura (ACSR)
 
-A diferencia de la fórmula simplificada para aluminio puro, esta calculadora aplica el procedimiento riguroso para conductores ACSR, que considera al cable como dos resistencias en paralelo: el núcleo de acero y la corona de hilos de aluminio.
+Procedimiento riguroso que considera al cable como dos resistencias en paralelo: el núcleo de acero y la corona de hilos de aluminio.
 
 **Paso 1 — Área de cada material:**
 
 $$A = n_h \cdot \frac{\pi}{4} \cdot D^2 \quad [\text{mm}^2]$$
 
-donde `n_h` es el número de hilos y `D` su diámetro individual.
-
-**Paso 2 — Resistencia DC a 20 °C de cada material, con factor de cableado:**
+**Paso 2 — Resistencia DC a 20 °C de cada material:**
 
 $$R_{20} = \frac{\rho \cdot 1000 \cdot \text{Factor}}{A} \quad [\Omega/\text{km}]$$
 
@@ -125,9 +152,31 @@ $$L_b = 2 \times 10^{-7} \cdot \ln\left(\frac{\sqrt{D_{12} \cdot D_{23}}}{r'}\ri
 
 $$L_c = 2 \times 10^{-7} \cdot \ln\left(\frac{\sqrt{D_{23} \cdot D_{31}}}{r'}\right)$$
 
-**Doble circuito** — RMG equivalente del grupo paralelo:
+**Doble circuito / conductores en paralelo:**
 
-$$\text{RMG}_{eq} = \sqrt{\text{RMG} \cdot D_{\text{entre}}}$$
+El RMG de cada lado (lado A con `n` conductores, lado B con `m` conductores) se calcula a partir de las coordenadas (x, y) usando la fórmula general:
+
+$$\text{RMG} = \sqrt[n^2]{\prod_{i=1}^{n} \prod_{j=1}^{n} D_{ij}}$$
+
+donde `D_ii` se reemplaza por el GMR del conductor individual (RMG de tabla para ACSR, `r · 0.7788` para conductores sólidos).
+
+La DMG mutua entre los dos lados se calcula como:
+
+$$\text{DMG} = \sqrt[m \cdot n]{\prod_{i \in A} \prod_{j \in B} D_{ij}}$$
+
+donde `D_ij` es la distancia euclidiana entre coordenadas.
+
+La inductancia final depende del tipo de conductores:
+
+- **Conductores iguales** (mismo conductor en ambos lados):
+
+$$L = 4 \times 10^{-7} \cdot \ln\left(\frac{\text{DMG}}{\text{RMG}}\right) \quad [\text{H/m}]$$
+
+- **Conductores distintos**:
+
+$$L_A = 2 \times 10^{-7} \cdot \ln\left(\frac{\text{DMG}}{\text{RMG}_A}\right), \quad L_B = 2 \times 10^{-7} \cdot \ln\left(\frac{\text{DMG}}{\text{RMG}_B}\right)$$
+
+$$L_T = L_A + L_B \quad [\text{H/m}]$$
 
 **RMG del haz** para `n` conductores por fase con separación `d`:
 
@@ -146,7 +195,11 @@ $$C = \frac{2 \pi \varepsilon_0}{\ln(\text{DMG} / r_{eq})} \quad [\text{F/m}]$$
 
 con `ε₀ = 8.85 × 10⁻¹² F/m`.
 
-Las fórmulas del bundle son las mismas pero usando `r` en lugar de `r'`.
+Para doble circuito con conductores iguales:
+
+$$C = \frac{4 \pi \varepsilon_0}{\ln(\text{DMG} / r)} \quad [\text{F/m}]$$
+
+Para doble circuito con conductores distintos se calcula `C_A` y `C_B` y se combinan en paralelo.
 
 ### 4. Reactancias
 
@@ -164,22 +217,25 @@ $$X_c = \frac{1}{2 \pi f C \cdot 1000} \quad [\Omega \cdot \text{km}]$$
 
 ## Interfaz gráfica
 
-La ventana se organiza en cuatro secciones principales:
+La ventana principal se organiza en cuatro bloques verticales:
 
-1. **Catálogo ACSR** — Selección del conductor por código directo o por filtros en cascada.
-2. **Parámetros de la línea** — Configuración geométrica y eléctrica.
+1. **Catálogo ACSR — Conductor principal (Circuito A)** — Selección por código directo o por filtros en cascada.
+2. **Parámetros de la Línea** — Configuración, frecuencia, longitud, temperatura. Para líneas de un solo circuito incluye conductores por fase y distancias `D₁₂/D₂₃/D₃₁`. Para doble circuito muestra el botón de configuración.
 3. **Botón CALCULAR PARÁMETROS** — Ejecuta los cálculos según la configuración seleccionada.
-4. **Resultados** — Organizados en tres bloques diferenciados:
+4. **Resultados** — Organizados en hasta cinco secciones:
    - ① Corrección de Resistencia por Temperatura (ACSR) — Tabla paso a paso por material
    - ② Inductancia y Reactancia Inductiva
    - ③ Capacitancia y Reactancia Capacitiva
    - ④ Parámetros por fase (visible solo en líneas no transpuestas)
+   - ⑤ Detalle de Doble Circuito (visible solo en doble circuito): muestra el conductor de cada lado, número de conductores, RMG por lado, L y C por lado (cuando conductores son distintos), DMG entre lados y tipo (iguales/distintos)
 
 ---
 
 ## Validación
 
-El módulo de cálculo de resistencia se validó contra el ejemplo de referencia del **conductor Dove (26/7) a 75 °C** del documento *Corrección de resistencia por temperatura para ACSR*:
+### Corrección de resistencia ACSR
+
+Validado contra el ejemplo de referencia del **conductor Dove (26/7) a 75 °C**:
 
 | Resultado | Esperado | Calculado |
 |---|---|---|
@@ -191,7 +247,21 @@ El módulo de cálculo de resistencia se validó contra el ejemplo de referencia
 | R(75°C) Ac | 3.8509 Ω/km | 3.850901 Ω/km |
 | **R_TOT** | **0.119953 Ω/km** | **0.119959 Ω/km** |
 
-Las diferencias mínimas (sexto decimal) corresponden al redondeo intermedio en el documento de referencia.
+### Doble circuito (geometría 3+2 conductores)
+
+Validado contra el ejemplo de la figura 2.9 del libro de referencia:
+- Lado A: 3 conductores en columna `x=0`, alturas `y={8, 4, 0}` m
+- Lado B: 2 conductores en columna `x=8`, alturas `y={6, 2}` m
+- Conductor sólido de radio `r=50 mm`
+
+| Resultado | Valor calculado |
+|---|---|
+| RMG Lado A (3 cond.) | 0.9963 m |
+| RMG Lado B (2 cond.) | 0.3947 m |
+| DMG entre lados | 8.7937 m |
+| L total (iguales) | 0.8711 mH/km |
+
+Las diferencias mínimas (sexto decimal) corresponden al redondeo intermedio en los documentos de referencia.
 
 ---
 
