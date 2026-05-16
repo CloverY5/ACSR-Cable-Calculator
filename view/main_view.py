@@ -40,7 +40,9 @@ class MainView(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"{self.APP_TITLE}  {self.APP_VERSION}")
-        self.resizable(False, False)
+        # Allow both horizontal and vertical resizing.
+        # Initial size is set after building UI so it adapts to the screen.
+        self.resizable(True, True)
 
         self._controller = None
         # Persistent storage for the double-circuit dialog state
@@ -319,9 +321,41 @@ class MainView(tk.Tk):
                   background=[("active", "#093526")])
 
     def _build_ui(self):
-        outer = ttk.Frame(self, padding=12)
-        outer.grid(row=0, column=0, sticky="nsew")
+        # ── Scrollable container ────────────────────────────────────────
+        # We wrap all content in a Canvas + vertical Scrollbar so that
+        # if the window is taller than the screen, the user can scroll
+        # the contents instead of having the window overflow.
+        container = ttk.Frame(self)
+        container.grid(row=0, column=0, sticky="nsew")
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=1)
 
+        self._canvas = tk.Canvas(container, highlightthickness=0, borderwidth=0)
+        vsb = ttk.Scrollbar(container, orient="vertical",
+                            command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=vsb.set)
+
+        self._canvas.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        container.grid_rowconfigure(0, weight=1)
+        container.grid_columnconfigure(0, weight=1)
+
+        # The actual UI is built inside this inner frame and placed in the canvas.
+        outer = ttk.Frame(self._canvas, padding=12)
+        self._canvas_window = self._canvas.create_window(
+            (0, 0), window=outer, anchor="nw"
+        )
+
+        # Keep the scrollregion in sync with the content size.
+        outer.bind("<Configure>", self._on_inner_configure)
+        self._canvas.bind("<Configure>", self._on_canvas_configure)
+
+        # Mouse-wheel support (Windows / macOS / Linux)
+        self.bind_all("<MouseWheel>", self._on_mousewheel)     # Win / macOS
+        self.bind_all("<Button-4>",   self._on_mousewheel_lin) # Linux up
+        self.bind_all("<Button-5>",   self._on_mousewheel_lin) # Linux down
+
+        # ── Build the actual content inside `outer` ─────────────────────
         ttk.Label(outer, text=self.APP_TITLE,
                   font=("Helvetica", 14, "bold"),
                   foreground=_C_TITLE).grid(row=0, column=0, pady=(0, 10))
@@ -335,6 +369,53 @@ class MainView(tk.Tk):
                    ).grid(row=3, column=0, sticky="ew", pady=10, ipady=4)
 
         self._build_results_section(outer, row=4)
+
+        # ── Set a sensible initial window size ──────────────────────────
+        self.after(50, self._set_initial_geometry)
+
+    def _on_inner_configure(self, _event=None):
+        """Refresh the scrollable region whenever the inner content resizes."""
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event):
+        """Make the inner frame match the canvas width (so columns expand)."""
+        self._canvas.itemconfig(self._canvas_window, width=event.width)
+
+    def _on_mousewheel(self, event):
+        """Vertical scroll with the wheel on Windows / macOS."""
+        # Windows: event.delta is multiple of 120; macOS: multiple of 1
+        delta = -1 * int(event.delta / 120) if abs(event.delta) >= 120 else -event.delta
+        self._canvas.yview_scroll(delta, "units")
+
+    def _on_mousewheel_lin(self, event):
+        """Vertical scroll with the wheel on Linux (Button-4 / Button-5)."""
+        if event.num == 4:
+            self._canvas.yview_scroll(-1, "units")
+        elif event.num == 5:
+            self._canvas.yview_scroll(1, "units")
+
+    def _set_initial_geometry(self):
+        """
+        Choose a starting window size that fits both the content and the
+        screen, so the user does not see a giant window on small displays.
+        """
+        self.update_idletasks()
+        screen_h = self.winfo_screenheight()
+        screen_w = self.winfo_screenwidth()
+        # Required content size:
+        content_w = self._canvas.bbox("all")[2] if self._canvas.bbox("all") else 1000
+        content_h = self._canvas.bbox("all")[3] if self._canvas.bbox("all") else 700
+
+        # Leave a margin for the taskbar / window decorations.
+        max_h = int(screen_h * 0.88)
+        win_h = min(content_h + 20, max_h)
+        # Add generous horizontal padding so the right column is never cut off
+        # (scrollbar + frame padding + a bit of safety margin).
+        win_w = min(content_w + 60, screen_w - 40)
+
+        self.geometry(f"{win_w}x{win_h}")
+        # Don't let the user shrink the window narrower than the content
+        self.minsize(win_w, 400)
 
     # ==================================================================
     # Catalog section
