@@ -14,13 +14,12 @@ from model.calculations import (
     geometric_mean_distance,
     inductance_per_meter,
     inductance_untransposed,
-    conductor_gmr_m,
-    rmg_side,
-    dmg_between_sides,
-    inductance_double_circuit,
-    capacitance_double_circuit,
+    inductance_monophasic,
     capacitance_per_meter,
     capacitance_untransposed,
+    capacitance_monophasic,
+    conductor_gmr_m,
+    rigorous_double_circuit_params,
     reactance_per_km,
     capacitive_reactance_per_km,
     total_reactance,
@@ -28,6 +27,7 @@ from model.calculations import (
     total_resistance,
     to_mH_per_km,
     to_nF_per_km,
+    to_uF_per_km,
 )
 
 COL_D_AL = "D. Alambre Al (mm)"
@@ -36,6 +36,7 @@ COL_D_AC = "D. Alambre Acero (mm)"
 CFG_TRANSPOSED   = "transposed"
 CFG_UNTRANSPOSED = "untransposed"
 CFG_DOUBLE       = "double"
+CFG_MONOPHASIC   = "monophasic"
 
 
 class AppController:
@@ -47,7 +48,8 @@ class AppController:
 
         self._previewed_conductor: dict | None = None
         self._confirmed_conductor: dict | None = None
-        # Second conductor for double-circuit when sides are different
+        # Conductor for side/circuit B (monophasic with different conductors,
+        # or double circuit with different conductors)
         self._previewed_conductor_b: dict | None = None
         self._confirmed_conductor_b: dict | None = None
 
@@ -57,7 +59,7 @@ class AppController:
         self._view.populate_calibre_list_b(calibres)
 
     # ------------------------------------------------------------------
-    # Catalog – side A (default)
+    # Catalog – conductor A (main)
     # ------------------------------------------------------------------
 
     def handle_search_by_code(self, code: str):
@@ -112,7 +114,7 @@ class AppController:
         )
 
     # ------------------------------------------------------------------
-    # Catalog – side B (for different-conductor double circuit)
+    # Catalog – conductor B (for double-circuit with different conductors)
     # ------------------------------------------------------------------
 
     def handle_calibre_selected_b(self, calibre: str):
@@ -152,7 +154,7 @@ class AppController:
         name = self._confirmed_conductor_b[COL_CODE]
         self._view.show_info(
             "Conductor circuito B confirmado",
-            f"'{name}' será usado para el lado B de la línea."
+            f"'{name}' será usado para el lado B/circuito 2."
         )
 
     # ------------------------------------------------------------------
@@ -175,9 +177,6 @@ class AppController:
             length = _parse_pos("Longitud",   params["length"])
             temp   = float(params["temp"])
             n_cond = int(params["n_cond"])
-            D12    = _parse_pos("D₁₂", params["D12"])
-            D23    = _parse_pos("D₂₃", params["D23"])
-            D31    = _parse_pos("D₃₁", params["D31"])
 
             rmg_mm     = float(self._confirmed_conductor[COL_RMG])
             d_total_mm = float(self._confirmed_conductor[COL_D_TOTAL])
@@ -192,16 +191,25 @@ class AppController:
             else:
                 spacing = 0.0
 
+            # Single-circuit distances (only used by transposed/untransposed)
+            if config in (CFG_TRANSPOSED, CFG_UNTRANSPOSED):
+                D12 = _parse_pos("D₁₂", params["D12"])
+                D23 = _parse_pos("D₂₃", params["D23"])
+                D31 = _parse_pos("D₃₁", params["D31"])
+            else:
+                D12 = D23 = D31 = None
+
         except (ValueError, TypeError) as exc:
             self._view.show_error("Error de entrada", str(exc))
             return
 
         try:
-            # ── ACSR resistance correction (always computed for side A) ──
+            # ── Resistance (always for side A) ────────────────────────────
             res_dict = acsr_resistance(n_al, d_al_mm, n_ac, d_ac_mm, temp)
             R_TOT = res_dict["R_TOT"]
             R_total_line = total_resistance(R_TOT, length)
 
+            # ── Bundle helpers ────────────────────────────────────────────
             rmg_haz_m  = bundle_gmr(rmg_mm, spacing, n_cond)
             r_bundle_m = bundle_radius(r_cond_m, spacing, n_cond)
             rmg_haz_mm  = rmg_haz_m  * 1000.0
@@ -217,18 +225,22 @@ class AppController:
                     freq, length, D12, D23, D31,
                     rmg_mm / 1000.0, r_cond_m, rmg_haz_mm
                 )
-            elif config == CFG_DOUBLE:
-                results = self._calc_double_general(
-                    freq, length, temp,
-                    rmg_mm, r_cond_m, params
+            elif config == CFG_MONOPHASIC:
+                results = self._calc_monophasic(
+                    freq, length, temp, params,
+                    rmg_mm, r_cond_m, n_cond, spacing
                 )
-                # Override resistance for double-circuit:
-                #   if different conductors → parallel of R_TOT_A and R_TOT_B
                 if results.get("R_TOT_override") is not None:
                     R_TOT = results["R_TOT_override"]
                     R_total_line = total_resistance(R_TOT, length)
-                    # Also override res_dict with composite info
-                    res_dict = results.get("res_dict_override", res_dict)
+            elif config == CFG_DOUBLE:
+                results = self._calc_double_rigorous(
+                    freq, length, temp, params,
+                    rmg_mm, r_cond_m, n_cond, spacing
+                )
+                if results.get("R_TOT_override") is not None:
+                    R_TOT = results["R_TOT_override"]
+                    R_total_line = total_resistance(R_TOT, length)
             else:
                 self._view.show_error("Configuración",
                                       f"Configuración desconocida: {config}")
@@ -245,7 +257,7 @@ class AppController:
         self._view.display_results(results)
 
     # ------------------------------------------------------------------
-    # Per-configuration calculations
+    # Calculations per configuration
     # ------------------------------------------------------------------
 
     def _calc_transposed(self, freq, length, D12, D23, D31,
@@ -262,21 +274,11 @@ class AppController:
         Xc_km   = capacitive_reactance_per_km(freq, C_F_m)
         Xc_tot  = total_capacitive_reactance(Xc_km, length)
 
-        return {
-            "config":   "Transpuesta",
-            "dmg":      f"{dmg:.4f}",
-            "rmg_haz":  f"{rmg_haz_mm:.4f}",
-            "r_bundle": f"{r_bundle_mm:.4f}",
-            "L_mH_km":  f"{L_mH_km:.4f}",
-            "XL_km":    f"{XL_km:.4f}",
-            "XL_total": f"{XL_tot:.4f}",
-            "C_nF_km":  f"{C_nF_km:.4f}",
-            "Xc_km":    f"{Xc_km:.4f}",
-            "Xc_total": f"{Xc_tot:.4f}",
-            "La": None, "Lb": None, "Lc": None,
-            "Ca": None, "Cb": None, "Cc": None,
-            "double_info": None,
-        }
+        return self._common_result_dict(
+            config="Transpuesta", dmg=dmg, rmg_haz=rmg_haz_mm, r_bundle=r_bundle_mm,
+            L=L_mH_km, XL=XL_km, XL_tot=XL_tot,
+            C=C_nF_km, Xc=Xc_km, Xc_tot=Xc_tot,
+        )
 
     def _calc_untransposed(self, freq, length, D12, D23, D31,
                            rmg_m, r_m, rmg_haz_mm):
@@ -296,17 +298,15 @@ class AppController:
         Xcb = capacitive_reactance_per_km(freq, Cb)
         Xcc = capacitive_reactance_per_km(freq, Cc)
 
-        return {
-            "config":   "No Transpuesta",
-            "dmg":      f"{dmg:.4f}",
-            "rmg_haz":  f"{rmg_haz_mm:.4f}",
-            "r_bundle": f"{r_m*1000:.4f}",
-            "L_mH_km":  f"{to_mH_per_km(L_avg):.4f}",
-            "XL_km":    f"{reactance_per_km(freq, L_avg):.4f}",
-            "XL_total": f"{total_reactance(reactance_per_km(freq, L_avg), length):.4f}",
-            "C_nF_km":  f"{to_nF_per_km(C_avg):.4f}",
-            "Xc_km":    f"{capacitive_reactance_per_km(freq, C_avg):.4f}",
-            "Xc_total": f"{total_capacitive_reactance(capacitive_reactance_per_km(freq, C_avg), length):.4f}",
+        result = self._common_result_dict(
+            config="No Transpuesta", dmg=dmg, rmg_haz=rmg_haz_mm, r_bundle=r_m*1000,
+            L=to_mH_per_km(L_avg), XL=reactance_per_km(freq, L_avg),
+            XL_tot=total_reactance(reactance_per_km(freq, L_avg), length),
+            C=to_nF_per_km(C_avg),
+            Xc=capacitive_reactance_per_km(freq, C_avg),
+            Xc_tot=total_capacitive_reactance(capacitive_reactance_per_km(freq, C_avg), length),
+        )
+        result.update({
             "La":  f"{to_mH_per_km(La):.4f}",
             "Lb":  f"{to_mH_per_km(Lb):.4f}",
             "Lc":  f"{to_mH_per_km(Lc):.4f}",
@@ -315,54 +315,156 @@ class AppController:
             "Cb":  f"{to_nF_per_km(Cb):.4f}",
             "Cc":  f"{to_nF_per_km(Cc):.4f}",
             "Xca": f"{Xca:.4f}", "Xcb": f"{Xcb:.4f}", "Xcc": f"{Xcc:.4f}",
-            "double_info": None,
-        }
+        })
+        return result
 
-    def _calc_double_general(self, freq, length, temp,
-                             rmg_mm_A, r_cond_m_A, params):
-        """
-        Double-circuit / parallel circuits computed from (x, y) coordinates.
+    def _calc_monophasic(self, freq, length, temp, params,
+                         rmg_mm_A, r_cond_m_A, n_cond, spacing):
+        """Monophasic line: 2 conductors with possibly different radii."""
+        mono = params.get("mono", {})
+        same_cond = mono.get("same_conductors", True)
+        side_A_type = mono.get("side_A_type", "acsr")
+        side_B_type = mono.get("side_B_type", "acsr")
+        D_m = _parse_pos("Distancia D entre conductores", mono.get("D_m", "4.0"))
 
-        Reads from params:
-          coords_A          – list of (x, y) for side A
-          coords_B          – list of (x, y) for side B
-          same_conductors   – bool
-          side_A_type       – 'acsr' or 'solid'
-          side_A_radius_mm  – if solid (radius in mm)
-          side_B_type       – 'acsr' or 'solid'
-          side_B_radius_mm  – if solid
-        """
-        coords_A = params["coords_A"]
-        coords_B = params["coords_B"]
-        same     = params["same_conductors"]
+        # ── Side A ─────────────────────────────────────────────────────
+        if side_A_type == "acsr":
+            r_A_m   = r_cond_m_A
+            gmr_A_m = conductor_gmr_m(rmg_mm=rmg_mm_A, is_acsr=True)
+            name_A  = self._confirmed_conductor[COL_CODE]
+        else:
+            r_A_m   = _parse_pos("Radio A", mono.get("side_A_radius_mm", 10)) / 1000.0
+            gmr_A_m = conductor_gmr_m(r_m=r_A_m, is_acsr=False)
+            name_A  = f"Sólido r={r_A_m*1000:.2f} mm"
 
-        if len(coords_A) == 0:
-            raise ValueError("El lado A no tiene conductores definidos.")
-        if len(coords_B) == 0:
-            raise ValueError("El lado B no tiene conductores definidos.")
+        # ── Side B ─────────────────────────────────────────────────────
+        if same_cond:
+            r_B_m = r_A_m
+            gmr_B_m = gmr_A_m
+            name_B = name_A
+            conductor_b_for_res = None
+        else:
+            if side_B_type == "acsr":
+                if self._confirmed_conductor_b is None:
+                    raise ValueError("Confirme primero un conductor para el lado B.")
+                rmg_mm_B = float(self._confirmed_conductor_b[COL_RMG])
+                d_tot_B  = float(self._confirmed_conductor_b[COL_D_TOTAL])
+                r_B_m    = (d_tot_B / 2.0) / 1000.0
+                gmr_B_m  = conductor_gmr_m(rmg_mm=rmg_mm_B, is_acsr=True)
+                name_B   = self._confirmed_conductor_b[COL_CODE]
+                conductor_b_for_res = self._confirmed_conductor_b
+            else:
+                r_B_m   = _parse_pos("Radio B", mono.get("side_B_radius_mm", 10)) / 1000.0
+                gmr_B_m = conductor_gmr_m(r_m=r_B_m, is_acsr=False)
+                name_B  = f"Sólido r={r_B_m*1000:.2f} mm"
+                conductor_b_for_res = None
 
-        side_A_type      = params.get("side_A_type", "acsr")
-        side_A_radius_mm = params.get("side_A_radius_mm", None)
-        side_B_type      = params.get("side_B_type", "acsr")
-        side_B_radius_mm = params.get("side_B_radius_mm", None)
+        # ── Apply bundle r_e if there is a bundle ──────────────────────
+        if n_cond > 1:
+            r_A_eff = bundle_radius(r_A_m, spacing, n_cond)
+            r_B_eff = bundle_radius(r_B_m, spacing, n_cond)
+            gmr_A_eff = bundle_gmr(gmr_A_m * 1000.0, spacing, n_cond)
+            gmr_B_eff = bundle_gmr(gmr_B_m * 1000.0, spacing, n_cond)
+        else:
+            r_A_eff, r_B_eff = r_A_m, r_B_m
+            gmr_A_eff, gmr_B_eff = gmr_A_m, gmr_B_m
 
-        # ── Side A: determine GMR (inductance) and physical radius (capacitance)
+        # ── Capacitance ────────────────────────────────────────────────
+        cap = capacitance_monophasic(r_A_eff, r_B_eff, D_m)
+        C_F_m = cap["C_an"]
+        C_ab_F_m = cap["C_ab"]
+        C_nF_km = to_nF_per_km(C_F_m)
+        C_ab_nF_km = to_nF_per_km(C_ab_F_m)
+        Xc_km   = capacitive_reactance_per_km(freq, C_F_m)
+        Xc_tot  = total_capacitive_reactance(Xc_km, length)
+
+        # ── Inductance (loop) ──────────────────────────────────────────
+        L_H_m = inductance_monophasic(gmr_A_eff, gmr_B_eff, D_m)
+        L_mH_km = to_mH_per_km(L_H_m)
+        XL_km = reactance_per_km(freq, L_H_m)
+        XL_tot = total_reactance(XL_km, length)
+
+        # ── Combined ACSR resistance if B is also ACSR (parallel) ──────
+        R_TOT_override = None
+        if not same_cond and side_A_type == "acsr" and side_B_type == "acsr" \
+                and conductor_b_for_res is not None:
+            n_al_A, n_ac_A = _parse_stranding(self._confirmed_conductor[COL_RATIO])
+            d_al_A = float(self._confirmed_conductor[COL_D_AL])
+            d_ac_A = float(self._confirmed_conductor[COL_D_AC])
+            resA = acsr_resistance(n_al_A, d_al_A, n_ac_A, d_ac_A, temp)
+
+            n_al_B, n_ac_B = _parse_stranding(conductor_b_for_res[COL_RATIO])
+            d_al_B = float(conductor_b_for_res[COL_D_AL])
+            d_ac_B = float(conductor_b_for_res[COL_D_AC])
+            resB = acsr_resistance(n_al_B, d_al_B, n_ac_B, d_ac_B, temp)
+
+            # In monophasic loop, R_loop = R_A + R_B  (series)
+            R_TOT_override = resA["R_TOT"] + resB["R_TOT"]
+
+        result = self._common_result_dict(
+            config=f"Monofásica ({'iguales' if same_cond else 'distintos'})",
+            dmg=D_m, rmg_haz=gmr_A_eff*1000, r_bundle=r_A_eff*1000,
+            L=L_mH_km, XL=XL_km, XL_tot=XL_tot,
+            C=C_nF_km, Xc=Xc_km, Xc_tot=Xc_tot,
+        )
+        result.update({
+            "mono_info": {
+                "name_A":  name_A,
+                "name_B":  name_B,
+                "same":    same_cond,
+                "r_A_mm":  f"{r_A_eff*1000:.4f}",
+                "r_B_mm":  f"{r_B_eff*1000:.4f}",
+                "D_m":     f"{D_m:.4f}",
+                "C_an":    f"{C_nF_km:.4f}",
+                "C_ab":    f"{C_ab_nF_km:.4f}",
+            },
+            "R_TOT_override": R_TOT_override,
+        })
+        return result
+
+    def _calc_double_rigorous(self, freq, length, temp, params,
+                              rmg_mm_A, r_cond_m_A, n_cond, spacing):
+        """Rigorous double-circuit with phase identification (PDF formulas)."""
+        dc = params.get("dc", {})
+        same_cond = dc.get("same_conductors", True)
+        side_A_type = dc.get("side_A_type", "acsr")
+        side_B_type = dc.get("side_B_type", "acsr")
+
+        # Phase coordinates (each phase has 2 conductors: one per circuit)
+        phase_a = dc.get("phase_a", [])
+        phase_b = dc.get("phase_b", [])
+        phase_c = dc.get("phase_c", [])
+
+        for label, coords in [("a", phase_a), ("b", phase_b), ("c", phase_c)]:
+            if len(coords) != 2:
+                raise ValueError(
+                    f"La fase '{label}' debe tener exactamente 2 coordenadas "
+                    f"(una para circuito A y otra para circuito B)."
+                )
+
+        # ── Determine GMR and r for side A ─────────────────────────────
         if side_A_type == "acsr":
             gmr_A_m = conductor_gmr_m(rmg_mm=rmg_mm_A, is_acsr=True)
             r_A_m   = r_cond_m_A
             name_A  = self._confirmed_conductor[COL_CODE]
         else:
-            r_A_m = _parse_pos("Radio del conductor A", side_A_radius_mm) / 1000.0
+            r_A_m = _parse_pos("Radio A", dc.get("side_A_radius_mm", 10)) / 1000.0
             gmr_A_m = conductor_gmr_m(r_m=r_A_m, is_acsr=False)
-            name_A  = f"Sólido r={r_A_m*1000:.2f} mm"
+            name_A = f"Sólido r={r_A_m*1000:.2f} mm"
 
-        # ── Side B
-        if same:
-            gmr_B_m = gmr_A_m
-            r_B_m   = r_A_m
-            name_B  = name_A
-            conductor_b_for_res = None
+        # ── Apply bundle r_e if there are bundles ──────────────────────
+        if n_cond > 1:
+            gmr_self_L = bundle_gmr(gmr_A_m * 1000.0, spacing, n_cond)
+            r_self_C   = bundle_radius(r_A_m, spacing, n_cond)
         else:
+            gmr_self_L = gmr_A_m
+            r_self_C   = r_A_m
+
+        # For "different conductors", the rigorous PDF formula assumes
+        # symmetry side-A = side-B (the formula uses a single gmr/r).
+        # If users actually have different conductors per circuit, we still
+        # honour their choice by averaging the per-side gmr/r.
+        if not same_cond:
             if side_B_type == "acsr":
                 if self._confirmed_conductor_b is None:
                     raise ValueError("Confirme primero un conductor para el circuito B.")
@@ -373,101 +475,116 @@ class AppController:
                 name_B   = self._confirmed_conductor_b[COL_CODE]
                 conductor_b_for_res = self._confirmed_conductor_b
             else:
-                r_B_m = _parse_pos("Radio del conductor B", side_B_radius_mm) / 1000.0
+                r_B_m = _parse_pos("Radio B", dc.get("side_B_radius_mm", 10)) / 1000.0
                 gmr_B_m = conductor_gmr_m(r_m=r_B_m, is_acsr=False)
-                name_B  = f"Sólido r={r_B_m*1000:.2f} mm"
+                name_B = f"Sólido r={r_B_m*1000:.2f} mm"
                 conductor_b_for_res = None
+            if n_cond > 1:
+                gmr_self_L = math.sqrt(
+                    bundle_gmr(gmr_A_m * 1000.0, spacing, n_cond) *
+                    bundle_gmr(gmr_B_m * 1000.0, spacing, n_cond)
+                )
+                r_self_C = math.sqrt(
+                    bundle_radius(r_A_m, spacing, n_cond) *
+                    bundle_radius(r_B_m, spacing, n_cond)
+                )
+            else:
+                gmr_self_L = math.sqrt(gmr_A_m * gmr_B_m)
+                r_self_C   = math.sqrt(r_A_m * r_B_m)
+        else:
+            name_B = name_A
+            conductor_b_for_res = None
 
-        # ── RMG of each side and mutual DMG (general formulas)
-        RMG_A = rmg_side(coords_A, gmr_A_m)
-        RMG_B = rmg_side(coords_B, gmr_B_m)
-        DMG   = dmg_between_sides(coords_A, coords_B)
+        # ── Apply rigorous formula ─────────────────────────────────────
+        res = rigorous_double_circuit_params(
+            phase_a_coords=phase_a,
+            phase_b_coords=phase_b,
+            phase_c_coords=phase_c,
+            gmr_self_m=gmr_self_L,
+            r_self_m=r_self_C,
+        )
 
-        # ── Inductance
-        ind = inductance_double_circuit(RMG_A, RMG_B, DMG, same_conductors=same)
-        L_total = ind["L_total"]
-        XL_km   = reactance_per_km(freq, L_total)
+        L_H_m = res["L"]
+        C_F_m = res["C"]
+        L_mH_km = to_mH_per_km(L_H_m)
+        XL_km   = reactance_per_km(freq, L_H_m)
         XL_tot  = total_reactance(XL_km, length)
-
-        # ── Capacitance
-        cap = capacitance_double_circuit(r_A_m, r_B_m, DMG, same_conductors=same)
-        C_total = cap["C_total"]
-        Xc_km   = capacitive_reactance_per_km(freq, C_total)
+        C_nF_km = to_nF_per_km(C_F_m)
+        Xc_km   = capacitive_reactance_per_km(freq, C_F_m)
         Xc_tot  = total_capacitive_reactance(Xc_km, length)
 
-        # ── Per-side L (and C) for the "different conductors" case
-        if same:
-            LA_disp = LB_disp = "—"
-            CA_disp = CB_disp = "—"
-        else:
-            LA_disp = f"{to_mH_per_km(ind['L_A']):.4f}"
-            LB_disp = f"{to_mH_per_km(ind['L_B']):.4f}"
-            CA_disp = f"{to_nF_per_km(cap['C_A']):.4f}"
-            CB_disp = f"{to_nF_per_km(cap['C_B']):.4f}"
-
-        # ── Resistance handling for double circuit
+        # ── Combined ACSR resistance if both are ACSR ──────────────────
         R_TOT_override = None
-        res_dict_override = None
-        if same:
-            # use the normal acsr_resistance of side A; nothing to override
-            pass
-        else:
-            # If both sides have a known ACSR, compute R for each and combine
-            # in parallel (both circuits carry current in parallel).
-            if side_A_type == "acsr" and side_B_type == "acsr" \
-               and conductor_b_for_res is not None:
-                # Side A resistance already computed in the caller
-                n_al_A, n_ac_A = _parse_stranding(self._confirmed_conductor[COL_RATIO])
-                d_al_A = float(self._confirmed_conductor[COL_D_AL])
-                d_ac_A = float(self._confirmed_conductor[COL_D_AC])
-                resA = acsr_resistance(n_al_A, d_al_A, n_ac_A, d_ac_A, temp)
+        if not same_cond and side_A_type == "acsr" and side_B_type == "acsr" \
+                and conductor_b_for_res is not None:
+            n_al_A, n_ac_A = _parse_stranding(self._confirmed_conductor[COL_RATIO])
+            d_al_A = float(self._confirmed_conductor[COL_D_AL])
+            d_ac_A = float(self._confirmed_conductor[COL_D_AC])
+            resA = acsr_resistance(n_al_A, d_al_A, n_ac_A, d_ac_A, temp)
 
-                n_al_B, n_ac_B = _parse_stranding(conductor_b_for_res[COL_RATIO])
-                d_al_B = float(conductor_b_for_res[COL_D_AL])
-                d_ac_B = float(conductor_b_for_res[COL_D_AC])
-                resB = acsr_resistance(n_al_B, d_al_B, n_ac_B, d_ac_B, temp)
+            n_al_B, n_ac_B = _parse_stranding(conductor_b_for_res[COL_RATIO])
+            d_al_B = float(conductor_b_for_res[COL_D_AL])
+            d_ac_B = float(conductor_b_for_res[COL_D_AC])
+            resB = acsr_resistance(n_al_B, d_al_B, n_ac_B, d_ac_B, temp)
 
-                R_TOT_override = (resA["R_TOT"] * resB["R_TOT"]) / \
-                                 (resA["R_TOT"] + resB["R_TOT"])
-                # Use side-A dict but flag combined R_TOT
-                res_dict_override = resA
-            # If any side is solid, skip resistance override (user uses side A)
+            # Double circuit → two circuits in parallel
+            R_TOT_override = (resA["R_TOT"] * resB["R_TOT"]) / \
+                             (resA["R_TOT"] + resB["R_TOT"])
 
-        return {
-            "config":   "Doble Circuito" + (" (iguales)" if same else " (distintos)"),
-            "dmg":      f"{DMG:.4f}",
-            "rmg_haz":  f"{RMG_A*1000:.4f}",
-            "r_bundle": f"{r_A_m*1000:.4f}",
-            "L_mH_km":  f"{to_mH_per_km(L_total):.4f}",
-            "XL_km":    f"{XL_km:.4f}",
-            "XL_total": f"{XL_tot:.4f}",
-            "C_nF_km":  f"{to_nF_per_km(C_total):.4f}",
-            "Xc_km":    f"{Xc_km:.4f}",
-            "Xc_total": f"{Xc_tot:.4f}",
-            "La": None, "Lb": None, "Lc": None,
-            "Ca": None, "Cb": None, "Cc": None,
-            # Extra info for double-circuit details panel
+        result = self._common_result_dict(
+            config=f"Doble Circuito ({'iguales' if same_cond else 'distintos'})",
+            dmg=res["DMG_e"], rmg_haz=res["RMG_e_L"]*1000, r_bundle=res["RMG_e_C"]*1000,
+            L=L_mH_km, XL=XL_km, XL_tot=XL_tot,
+            C=C_nF_km, Xc=Xc_km, Xc_tot=Xc_tot,
+        )
+        result.update({
             "double_info": {
                 "name_A":  name_A,
                 "name_B":  name_B,
-                "same":    same,
-                "n_A":     len(coords_A),
-                "n_B":     len(coords_B),
-                "RMG_A":   f"{RMG_A:.4f}",
-                "RMG_B":   f"{RMG_B:.4f}",
-                "DMG":     f"{DMG:.4f}",
-                "L_A":     LA_disp,
-                "L_B":     LB_disp,
-                "C_A":     CA_disp,
-                "C_B":     CB_disp,
+                "same":    same_cond,
+                "DMG_ab":  f"{res['DMG_ab']:.4f}",
+                "DMG_bc":  f"{res['DMG_bc']:.4f}",
+                "DMG_ac":  f"{res['DMG_ac']:.4f}",
+                "DMG_e":   f"{res['DMG_e']:.4f}",
+                "D_aa":    f"{res['D_aa']:.4f}",
+                "D_bb":    f"{res['D_bb']:.4f}",
+                "D_cc":    f"{res['D_cc']:.4f}",
+                "RMG_a_L": f"{res['RMG_a_L']:.4f}",
+                "RMG_b_L": f"{res['RMG_b_L']:.4f}",
+                "RMG_c_L": f"{res['RMG_c_L']:.4f}",
+                "RMG_e_L": f"{res['RMG_e_L']:.4f}",
+                "RMG_a_C": f"{res['RMG_a_C']:.4f}",
+                "RMG_b_C": f"{res['RMG_b_C']:.4f}",
+                "RMG_c_C": f"{res['RMG_c_C']:.4f}",
+                "RMG_e_C": f"{res['RMG_e_C']:.4f}",
             },
             "R_TOT_override": R_TOT_override,
-            "res_dict_override": res_dict_override,
-        }
+        })
+        return result
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _common_result_dict(self, config, dmg, rmg_haz, r_bundle,
+                            L, XL, XL_tot, C, Xc, Xc_tot):
+        """Build the base result dict with the standard fields."""
+        return {
+            "config":   config,
+            "dmg":      f"{dmg:.4f}",
+            "rmg_haz":  f"{rmg_haz:.4f}",
+            "r_bundle": f"{r_bundle:.4f}",
+            "L_mH_km":  f"{L:.4f}",
+            "XL_km":    f"{XL:.4f}",
+            "XL_total": f"{XL_tot:.4f}",
+            "C_nF_km":  f"{C:.4f}",
+            "Xc_km":    f"{Xc:.4f}",
+            "Xc_total": f"{Xc_tot:.4f}",
+            "La": None, "Lb": None, "Lc": None,
+            "Ca": None, "Cb": None, "Cc": None,
+            "double_info": None,
+            "mono_info":   None,
+        }
 
     def _push_conductor_info(self, conductor: dict):
         self._view.display_conductor_info(

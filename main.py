@@ -1,7 +1,11 @@
-#!/usr/bin/env python3.12
+#!/usr/bin/env python3
 """
 ACSR Transmission Line Calculator
 Entry point – bootstraps the MVC stack and launches the GUI.
+
+Compatible with PyInstaller --onefile:
+  When frozen, sys._MEIPASS points to the temp folder where bundled
+  data files are extracted. We use that path to locate the CSV.
 """
 
 import os
@@ -10,9 +14,23 @@ import tkinter as tk
 from tkinter import messagebox
 
 
+def _resource_path(relative: str) -> str:
+    """
+    Return the absolute path to a bundled resource.
+
+    - When running from source:  path is relative to this file.
+    - When running as a PyInstaller --onefile exe: PyInstaller extracts
+      data files to a temporary folder stored in sys._MEIPASS.
+    """
+    if hasattr(sys, "_MEIPASS"):
+        # Running as a frozen executable
+        return os.path.join(sys._MEIPASS, relative)
+    # Running from source
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), relative)
+
+
 def main():
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    csv_path = os.path.join(base_dir, "ACSR-Tabla-RMG.csv")
+    csv_path = _resource_path("ACSR-Tabla-RMG.csv")
 
     # Load the conductor database before creating the main window so that
     # a missing CSV can be reported before the UI appears.
